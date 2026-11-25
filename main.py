@@ -33,12 +33,16 @@ output.
 
 Usage:
     python3 main.py
+    python3 main.py --verify-only   # validate entry.png without copying
 """
 
+import argparse
 import hashlib
 import shutil
 import struct
 import sys
+import tempfile
+import zlib
 from pathlib import Path
 
 # The entry image, resolved relative to this file so the script works
@@ -80,6 +84,32 @@ def read_png_dimensions(path: Path) -> tuple[int, int]:
     return width, height
 
 
+def check_ihdr_crc(path: Path) -> None:
+    """Verify the CRC-32 of the PNG file's IHDR chunk.
+
+    A PNG chunk's CRC covers its type bytes plus its data bytes, so a
+    corrupted header (or a file that merely starts with the PNG
+    signature) is caught here instead of passing the dimension check.
+
+    Raises:
+        ValueError: if the file is not a PNG or the IHDR CRC mismatches.
+    """
+    with path.open("rb") as handle:
+        header = handle.read(33)
+    if len(header) < 33 or header[:8] != PNG_SIGNATURE:
+        raise ValueError(f"not a PNG file (bad signature): {path}")
+    length, chunk_type = struct.unpack(">I4s", header[8:16])
+    if chunk_type != b"IHDR" or length != 13:
+        raise ValueError(f"not a PNG file (missing IHDR): {path}")
+    stored_crc, = struct.unpack(">I", header[29:33])
+    computed_crc = zlib.crc32(header[12:29]) & 0xFFFFFFFF
+    if stored_crc != computed_crc:
+        raise ValueError(
+            f"IHDR CRC mismatch in {path}: stored {stored_crc:#010x}, "
+            f"computed {computed_crc:#010x}"
+        )
+
+
 def validate_entry(path: Path) -> str:
     """Check the entry image against the bounty gate; return its hash.
 
@@ -102,6 +132,8 @@ def validate_entry(path: Path) -> str:
             f"unexpected dimensions: {width}x{height}, "
             f"expected {EXPECTED_WIDTH}x{EXPECTED_HEIGHT}"
         )
+
+    check_ihdr_crc(path)
 
     return sha256_of(path)
 
@@ -131,9 +163,56 @@ def copy_entry(source: Path, dest: Path) -> tuple[int, str]:
     return dest.stat().st_size, dest_hash
 
 
-def main() -> int:
+def check_determinism(source: Path) -> str:
+    """Prove the copy is deterministic: copy twice, compare hashes.
+
+    The entry pipeline is supposed to be a pure byte copy, so two
+    independent copies must hash identically. Running the copy into a
+    throwaway temp dir keeps this check side-effect free — it never
+    touches ``/output``.
+
+    Returns the (identical) SHA-256 digest of both copies.
+
+    Raises:
+        ValueError: if the two copies differ.
+    """
+    with tempfile.TemporaryDirectory(prefix="news-image-check-") as tmp:
+        tmp_dir = Path(tmp)
+        _, first_hash = copy_entry(source, tmp_dir / "first.png")
+        _, second_hash = copy_entry(source, tmp_dir / "second.png")
+    if first_hash != second_hash:
+        raise ValueError(
+            f"non-deterministic copy: {first_hash} != {second_hash}"
+        )
+    return first_hash
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Copy the news-image-20261125 entry to /output/entry.png."
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="validate entry.png (signature, IHDR CRC, dimensions, "
+        "size cap, hash) without copying it to /output",
+    )
+    args = parser.parse_args(argv)
+
     try:
+        if args.verify_only:
+            image_hash = validate_entry(SOURCE)
+            print(f"OK: {SOURCE} is a valid {EXPECTED_WIDTH}x{EXPECTED_HEIGHT} PNG")
+            print(f"  sha256: {image_hash}")
+            return 0
+
         byte_count, image_hash = copy_entry(SOURCE, DEST)
+
+        check_hash = check_determinism(SOURCE)
+        if check_hash != image_hash:
+            raise ValueError(
+                f"determinism check mismatch: {check_hash} != {image_hash}"
+            )
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -142,6 +221,7 @@ def main() -> int:
     print(f"  bytes : {byte_count}")
     print(f"  sha256: {image_hash}")
     print(f"  size  : {EXPECTED_WIDTH}x{EXPECTED_HEIGHT} PNG")
+    print(f"Summary: deterministic copy verified — 2/2 copies match ({image_hash[:12]}…)")
     return 0
 
 
